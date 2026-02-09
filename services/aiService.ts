@@ -2,42 +2,101 @@
 import { GameState, BettingAction, AiProvider, Player } from "../types";
 import { evaluateHand } from "./pokerUtils";
 import { SMALL_BLIND, BIG_BLIND } from "../constants";
+import { leaderboard } from './leaderboard';
 
 export class UnifiedPokerAI {
 
   private async callGenericApi(endpoint: string, key: string, prompt: string, provider: string, isReview: boolean = false) {
     try {
+      // If a local proxy is enabled (Vite env VITE_USE_API_PROXY=true),
+      // route request to the local serverless/proxy endpoint to avoid exposing keys in browser.
+      const useProxy = (import.meta as any)?.env?.VITE_USE_API_PROXY === 'true';
+      if (useProxy) {
+        try {
+          const proxyResp = await fetch('/api/proxy', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider, prompt, isReview })
+          });
+
+          if (!proxyResp.ok) {
+            const txt = await proxyResp.text().catch(() => '<no body>');
+            console.error('Proxy returned error:', proxyResp.status, txt);
+            throw new Error(`API error: ${proxyResp.status} - ${txt}`);
+          }
+
+          const contentType = proxyResp.headers.get('content-type') || '';
+          let data: any = null;
+          if (contentType.includes('application/json')) data = await proxyResp.json();
+          else { const txt = await proxyResp.text(); try { data = JSON.parse(txt); } catch { data = { text: txt }; } }
+
+          const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? (typeof data === 'string' ? data : null);
+          if (!content && !isReview) throw new Error('API returned empty content');
+          if (isReview) return (typeof content === 'string' ? content : JSON.stringify(content));
+          const jsonStr = (typeof content === 'string') ? (content.match(/\{[\s\S]*\}/)?.[0] || content) : JSON.stringify(content);
+          try { return JSON.parse(jsonStr); } catch (e) { throw new Error('INVALID_JSON_RESPONSE'); }
+        } catch (pErr: any) {
+          console.error('Proxy call failed:', pErr);
+          throw pErr;
+        }
+      }
       let modelName = '';
       if (provider === 'gpt') modelName = 'gpt-4';
       else if (provider === 'kimi') modelName = 'moonshot-v1-8k';
       else if (provider === 'deepseek') modelName = 'deepseek-chat';
       else if (provider === 'doubao') modelName = 'doubao-1-8-seed';
 
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${key}`
-        },
-        body: JSON.stringify({
-          model: modelName,
-          messages: [{ role: 'user', content: prompt }],
-          ...(isReview ? {} : { response_format: provider !== 'doubao' ? { type: 'json_object' } : undefined })
-        })
-      });
+      const bodyObj: any = {
+        model: modelName,
+        messages: [{ role: 'user', content: prompt }]
+      };
+
+      // Avoid sending unsupported `response_format` to OpenAI (causes 400)
+      if (!isReview && provider !== 'gpt' && provider !== 'doubao') {
+        bodyObj.response_format = { type: 'json_object' };
+      }
+
+      let response: Response;
+      try {
+        response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${key}`
+          },
+          body: JSON.stringify(bodyObj)
+        });
+      } catch (netErr: any) {
+        console.error(`Network error calling ${endpoint}:`, netErr?.message || netErr);
+        throw new Error('NETWORK_ERROR');
+      }
       
       if (response.status === 402 || response.status === 403) throw new Error("BILLING_EXHAUSTED");
       if (response.status === 401) throw new Error("INVALID_API_KEY");
       if (response.status === 429) throw new Error("QUOTA_EXCEEDED");
-      if (!response.ok) throw new Error(`API error: ${response.status}`);
-      
-      const data = await response.json();
-      const content = data.choices[0]?.message?.content;
-      if (!content) throw new Error("API returned empty content");
-      
-      if (isReview) return content;
-      const jsonStr = content.match(/\{[\s\S]*\}/)?.[0] || content;
-      return JSON.parse(jsonStr);
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '<no body>');
+        console.error(`API ${endpoint} returned ${response.status}:`, errText);
+        throw new Error(`API error: ${response.status} - ${errText}`);
+      }
+
+      const contentType = response.headers.get('content-type') || '';
+      let data: any = null;
+      if (contentType.includes('application/json')) {
+        data = await response.json();
+      } else {
+        const txt = await response.text();
+        // try parse as json if possible
+        try { data = JSON.parse(txt); } catch { data = { text: txt }; }
+      }
+
+      const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? (typeof data === 'string' ? data : null);
+      if (!content && !isReview) throw new Error('API returned empty content');
+
+      if (isReview) return (typeof content === 'string' ? content : JSON.stringify(content));
+
+      const jsonStr = (typeof content === 'string') ? (content.match(/\{[\s\S]*\}/)?.[0] || content) : JSON.stringify(content);
+      try { return JSON.parse(jsonStr); } catch (e) { throw new Error('INVALID_JSON_RESPONSE'); }
     } catch (e: any) {
       throw e;
     }
@@ -53,8 +112,22 @@ export class UnifiedPokerAI {
       : "这是标准长牌 (52张) 模式: 顺子 > 三条, 葫芦 > 同花。";
 
     const styleNote = aiPlayer.proStyle ? `\n【你的游玩风格参考】\n${aiPlayer.proStyle}` : "";
+    // 从排行榜获取当前排名信息（若存在）以影响激进/保守策略
+    const lbEntry = leaderboard.getPlayerEntry(aiPlayer.id);
+    let rankingNote = '';
+    if (lbEntry) {
+      const ranking = leaderboard.getRanking();
+      const total = ranking.length || state.players.length;
+      const pos = ranking.findIndex(e => e.id === aiPlayer.id) + 1;
+      if (pos > 0) {
+        const pct = pos / Math.max(1, total);
+        if (pct <= 0.33) rankingNote = '\n【榜单提示】你当前排名靠前（领先），本场请更保守，避免过度极化的 all-in 行为.';
+        else if (pct >= 0.66) rankingNote = '\n【榜单提示】你当前排名靠后（落后），本场可适度更激进以追分.';
+        else rankingNote = '\n【榜单提示】你当前排名中等，可按常规策略执行.';
+      }
+    }
 
-    const prompt = `你正在玩${isShort ? '短牌 (6+)' : '标准长牌'}德州扑克。${styleNote}
+    const prompt = `你正在玩${isShort ? '短牌 (6+)' : '标准长牌'}德州扑克。${styleNote}${rankingNote}
     【核心规则】${rulesNote}
     【盲注结构】SB: $${SMALL_BLIND} / BB: $${BIG_BLIND}
     【当前对局】

@@ -57,5 +57,45 @@
 -   [x] **多厂商适配**：优化了各厂商模型对 JSON 格式遵循不严的解析兼容性。
 -   [x] **持久化**：本地自动保存最近 10 局的胜负统计。
 
+## 本地代理（AI Proxy）
+
+为了避免在浏览器中暴露 API Key、绕过 CORS 限制，并在开发环境中更可靠地调用 AI 提供商，你可以运行本仓库内置的本地代理服务（基于 Express）。
+
+快速使用说明：
+
+1. 在项目根设置服务端环境变量（例：创建 `.env.proxy` 或在命令行中导出）：
+
+```bash
+# 示例（请替换为你自己的 Key，切勿提交到版本库）
+OPENAI_API_KEY=sk-...
+KIMI_API_KEY=...
+DEEPSEEK_API_KEY=...
+DOUBAO_API_KEY=...
+```
+
+2. 安装依赖并启动代理：
+
+```bash
+npm install
+npm run start:proxy
+```
+
+代理默认监听：`http://localhost:8787`，并提供 `/api/proxy` 路径转发到对应 AI 提供商。
+
+3. 启用前端使用代理模式（Vite）：在启动前设置 Vite 环境变量 `VITE_USE_API_PROXY=true`，例如：
+
+```bash
+# Windows PowerShell
+$env:VITE_USE_API_PROXY='true'; npm run dev
+
+# Windows cmd
+set VITE_USE_API_PROXY=true&& npm run dev
+```
+
+4. 注意事项：
+- 代理仅记录请求的 `provider` 与 prompt 长度、以及响应状态和大小，不会记录完整 prompt 或 AI 返回的内容，减少敏感数据泄露风险。
+- 请确保代理运行在受信任网络环境中；生产环境建议使用受管理的后端服务或 serverless 函数来托管代理。
+
+
 ---
 *由 AI 驱动，为追求极致的扑克玩家打造。*

@@ -8,6 +8,8 @@ import { PokerTable } from './components/PokerTable';
 import { Controls } from './components/Controls';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { HandChart } from './components/HandChart';
+import Leaderboard from './components/Leaderboard';
+import { leaderboard } from './services/leaderboard';
 
 const aiService = new UnifiedPokerAI();
 
@@ -41,6 +43,7 @@ const App: React.FC = () => {
   
   const [loading, setLoading] = useState(false);
   const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [apiError, setApiError] = useState<{title: string, message: string} | null>(null);
   const [localHistory, setLocalHistory] = useState<HandHistoryEntry[]>([]);
   const [streetBetCount, setStreetBetCount] = useState(0); 
@@ -124,6 +127,8 @@ const App: React.FC = () => {
       reviewProvider: reviewProvider // 存入 GameState
     };
     setGameState(initialState);
+    // 初始化榜单（本场内存）
+    leaderboard.init(initialState.players);
     setSetupMode(false);
     setMenuMode(false);
     setTimeout(() => dealNewHand(initialState, true), 100);
@@ -183,6 +188,8 @@ const App: React.FC = () => {
       analysisText: '',
       allInShowdown: false
     });
+    // Capture pre-hand chips for leaderboard delta calculation
+    leaderboard.capturePreHand(newPlayers);
   };
 
   const handleAction = async (playerId: string, action: BettingAction, amount: number) => {
@@ -352,6 +359,17 @@ const App: React.FC = () => {
     const showdownState: GameState = { ...finalState, players: updatedPlayers, phase: 'SHOWDOWN', currentPlayerIndex: -1, allInShowdown: false };
     setGameState(showdownState);
     saveHistory(winners.includes('p0') ? '胜利' : '失败', `底池: $${finalState.pot}`);
+    // 更新榜单：记录本局筹码变化并计数
+    leaderboard.recordPostHand(showdownState.players);
+    // 如果达到 20 局则结束本场比赛（返回菜单并展示最终榜单）
+    if (leaderboard.shouldEndGame()) {
+      const ranking = leaderboard.getRanking().map((r, i) => `${i + 1}. ${r.name} - ${r.score >= 0 ? `水上 ${r.score}` : `水下 ${Math.abs(r.score)}`}` ).join('\n');
+      alert('本场比赛已结束（20 局）。\n最终榜单：\n' + ranking);
+      // 将比赛结束并回到主菜单
+      setMenuMode(true);
+      setGameState(null);
+      return;
+    }
     setAnalysisLoading(true);
     try {
       const analysis = await aiService.reviewHand(showdownState);
@@ -387,7 +405,16 @@ const App: React.FC = () => {
       const safeAmount = Math.min(dec.amount || 0, maxTotal);
       handleAction(state.players[idx].id, dec.action, safeAmount);
     } catch (e: any) {
-      if (e.message === "BILLING_EXHAUSTED") setApiError({ title: "休眠", message: "API 余额不足" });
+      const msg = e?.message || String(e);
+      if (msg === "BILLING_EXHAUSTED") {
+        setApiError({ title: "休眠", message: "API 余额不足" });
+      } else if (msg === 'NETWORK_ERROR') {
+        setApiError({ title: '网络错误', message: '无法连接到 AI 后端。请检查代理服务或网络连接，或启用本地代理（USE_API_PROXY=true）。' });
+      } else if (msg && msg.includes('INVALID_JSON_RESPONSE')) {
+        setApiError({ title: '响应解析失败', message: 'AI 返回内容无法解析为 JSON。请检查代理或模型响应格式。' });
+      } else {
+        setApiError({ title: 'AI 调用失败', message: msg });
+      }
       handleAction(state.players[idx].id, state.currentBet <= state.players[idx].currentBet ? 'CHECK' : 'FOLD', 0);
     } finally { setLoading(false); }
   };
@@ -519,6 +546,7 @@ const App: React.FC = () => {
         <div className="flex items-center gap-4">
           {(loading || analysisLoading) && <div className="text-amber-500 text-[10px] animate-pulse font-bold tracking-widest uppercase"><i className="fas fa-robot mr-1"></i> {analysisLoading ? 'AI 复盘中' : 'AI 决策中'}</div>}
           <button onClick={() => dealNewHand(gameState!)} className="bg-slate-800 text-white px-4 py-1.5 rounded-lg text-[10px] font-bold border border-slate-700 hover:bg-slate-700 transition-colors">重新洗牌</button>
+          <button onClick={() => setShowLeaderboard(true)} className="bg-slate-800 text-white px-4 py-1.5 rounded-lg text-[10px] font-bold border border-slate-700 hover:bg-slate-700 transition-colors">榜单</button>
         </div>
       </header>
 
@@ -562,6 +590,7 @@ const App: React.FC = () => {
         </div>
       )}
       {gameState?.showAnalysis && <AnalysisPanel analysis={gameState.analysisText} onClose={() => setGameState(p => p ? {...p, showAnalysis: false} : null)} />}
+      <Leaderboard visible={showLeaderboard} onClose={() => setShowLeaderboard(false)} />
     </div>
   );
 };
